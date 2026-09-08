@@ -56,6 +56,7 @@ import {
   resolveSocketPath,
   socketHasLiveListener,
   startResolveIpcServer,
+  closeResolveIpcServer,
 } from '../context/resolve-ipc.ts';
 import { assembleTurnContext } from '../context/turn-context.ts';
 
@@ -899,7 +900,7 @@ async function checkHooksSmoke(engine: BrainEngine, ws: string, sourceId: string
   if (!dataDir) {
     return { id, ok: true, warn: true, detail: 'no PGLite data dir in config (Postgres brain?) — IPC smoke not applicable' };
   }
-  let server: { close: () => void } | null = null;
+  let server: import("node:net").Server | null = null;
   const prevSource = process.env.GBRAIN_SOURCE;
   const socketPath = resolveSocketPath(dataDir);
   // #4474: prefer the REAL socket. Pre-fix the smoke ALWAYS started its own
@@ -983,7 +984,10 @@ async function checkHooksSmoke(engine: BrainEngine, ws: string, sourceId: string
     if (prevSource === undefined) delete process.env.GBRAIN_SOURCE;
     else process.env.GBRAIN_SOURCE = prevSource;
     try {
-      server?.close();
+      // The smoke listener sits on the PRODUCTION socket path: close and reap
+      // only while it is still ours (Bun's server.close() unlinks by pathname
+      // and would take a serve that bound meanwhile down with it).
+      if (server) closeResolveIpcServer(socketPath, server);
     } catch {
       /* noop */
     }

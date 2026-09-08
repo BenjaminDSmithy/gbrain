@@ -52,6 +52,10 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   existsSync,
   unlinkSync,
+  statSync,
+  renameSync,
+  rmSync,
+  utimesSync,
   chmodSync,
   mkdirSync,
   readFileSync,
@@ -307,6 +311,11 @@ export interface IpcServerOpts {
    * turn_context request is rejected 'unauthorized' (fail closed).
    */
   secret?: string;
+  /**
+   * Owner heartbeat period for the socket file's mtime (see
+   * SOCKET_HEARTBEAT_MS). Test seam only — production callers leave it unset.
+   */
+  heartbeatMs?: number;
 }
 
 /** Canonical socket path for a PGLite data dir. */
@@ -724,14 +733,17 @@ function roundTrip(
 // ── Server ────────────────────────────────────────────────────────────────
 
 /**
- * Server: start an IPC listener on `socketPath`. Probes the path for an owner
- * first — unless the connect is hard-refused (nothing listens), returns null
- * and leaves the socket untouched: a serve that accepts, or one too busy to
- * accept within the probe budget, is the IPC provider (#4896). Only a dead
- * owner's leftover entry is cleaned up; then hardens the parent dir to 0700, and chmods
- * the socket 0600 BEFORE announcing readiness [S3#6]. Returns the net.Server
- * (caller closes on shutdown). Errors are swallowed (best-effort feature) —
- * returns null if the socket can't be bound.
+ * Server: start an IPC listener on `socketPath`. Under a start lock (atomic
+ * mkdir at `<socketPath>.starting`) probes the path for an owner first —
+ * unless the probe proves nothing listens, returns null and leaves the socket
+ * untouched: a serve that accepts, one too busy to accept within the probe
+ * budget, or one whose socket-file heartbeat is fresh, is the IPC provider
+ * (#4896). Only a dead owner's leftover entry is cleaned up; then hardens the
+ * parent dir to 0700, chmods the socket 0600 BEFORE announcing readiness
+ * [S3#6], records the inode it bound (closeResolveIpcServer reaps only that
+ * file) and heartbeats the file's mtime every SOCKET_HEARTBEAT_MS. Returns the
+ * net.Server (caller shuts it down via closeResolveIpcServer). Errors are
+ * swallowed (best-effort feature) — returns null if the socket can't be bound.
  *
  * Two call shapes [ENG-3]:
  *   - legacy positional: (socketPath, resolveHandler, onDelivered?) — v1
@@ -771,11 +783,34 @@ export async function startResolveIpcServer(
   // Only a provably dead owner is displaced (#4896 — a transient serve used
   // to unlink the long-lived one's socket and take the pathname with it on
   // exit). 'live' AND 'unknown' (probe timed out: a serve whose event loop
-  // is busy) both defer — this serve runs without IPC rather than risk it.
-  // ponytail: two serves probing within the same few microseconds both see
-  // no owner and the second unlink still displaces the first; a dev/ino
-  // identity re-check around the unlink is the upgrade path if it ever bites.
-  if ((await probeSocketOwner(socketPath)) !== 'dead') return null;
+  // is busy; or a connect error that describes the prober, not the owner)
+  // both defer — this serve runs without IPC rather than risk it.
+  //
+  // probe → reap → listen runs under a start lock (an atomic mkdir beside the
+  // socket path). Without it two serves probing within the same few
+  // microseconds both see no owner; the first reaps and binds, the second
+  // unlink displaces the first's LIVE socket — the #4896 steal re-created by
+  // a race — and the first could record the second's inode as its own. The
+  // second starter now sees the lock and returns null, exactly as it would
+  // for a live owner. A lock whose recorded owner has died is reclaimed at
+  // once; one whose owner is alive only past START_LOCK_STALE_MS.
+  const lock = acquireStartLock(socketPath);
+  if (!lock) return null;
+  let owner: SocketOwner;
+  try {
+    owner = await probeSocketOwner(socketPath);
+  } catch {
+    lock.release();
+    return null;
+  }
+  if (owner !== 'dead') {
+    lock.release();
+    return null;
+  }
+  // A starter that stalled long enough to be reclaimed from must not act on
+  // its stale verdict: the reclaimer may have bound the path since. Not ours
+  // to release either.
+  if (!lock.held()) return null;
   // Remove the dead owner's socket file so bind() can succeed. NOT gated on
   // existsSync/statSync (#4333): on win32 Bun binds a plain path as a real
   // AF_UNIX socket, which leaves a reparse-point file that Bun's existsSync()/
@@ -783,6 +818,9 @@ export async function startResolveIpcServer(
   // unlink is the only fs call that observes the entry. ENOENT and EISDIR/
   // EPERM (a directory we must not touch) are swallowed.
   try { unlinkSync(socketPath); } catch { /* nothing stale, or not ours to remove */ }
+  // The lock stays held through listen() and the inode snapshot below, so no
+  // concurrent starter can slip between our listen() and our stat(); the
+  // listen callback and the listen error handler release it.
 
   return new Promise((resolve) => {
     const server = net.createServer((conn) => {
@@ -881,14 +919,276 @@ export async function startResolveIpcServer(
       if (process.env.GBRAIN_DEBUG === '1') {
         process.stderr.write(`[resolve-ipc] listen failed (${e.code ?? 'unknown'}) at ${socketPath}\n`);
       }
+      // EADDRINUSE here is losing a concurrent election: whoever bound is the
+      // provider. Either way the start lock is ours to give back.
+      lock.release();
       resolve(null);
     });
     server.listen(socketPath, () => {
       // Mode set BEFORE readiness is announced (the resolve() below) [S3#6].
       try { chmodSync(socketPath, 0o600); } catch { /* best effort */ }
+      // Remember the inode of the file THIS server created, so the owner's
+      // shutdown can tell its own socket from one another serve has since put
+      // at the same path (closeResolveIpcServer / unlinkSocketIfOwned).
+      // Unknown inode → the close path leaves the file alone; the next
+      // starter's probe reaps a truly stale one. Taken while the start lock
+      // is still held, so it is ours.
+      let ino: number | undefined;
+      try {
+        ino = statSync(socketPath).ino;
+        (server as OwnedSocketServer)[OWNED_SOCKET_INODE] = ino;
+      } catch { /* best effort */ }
+      // Owner record: `<socket>.owner` = { pid, ino }. Independent liveness
+      // evidence for probers — a pid does not share our event loop, so a
+      // stalled owner stays live and a crashed one is reaped at once
+      // (classifyRefusedProbe). Written only when we know which inode is ours.
+      if (ino !== undefined) writeOwnerSidecar(socketPath, ino);
+      // Owner heartbeat: keep the socket file's mtime fresh so a prober whose
+      // connect was refused can tell a BUSY owner from a dead leftover
+      // (classifyRefusedProbe). connect()/accept() never touch a unix
+      // socket's inode times, so the mtime is ours alone. Touch only while
+      // the path is still ours — a displaced listener must never freshen the
+      // newcomer's file.
+      const hbMs = opts.heartbeatMs ?? SOCKET_HEARTBEAT_MS;
+      const hb = setInterval(() => {
+        if (!ownsSocketPath(socketPath, server)) { clearInterval(hb); return; }
+        const now = new Date();
+        try { utimesSync(socketPath, now, now); } catch { /* best effort */ }
+      }, hbMs);
+      hb.unref?.();
+      (server as OwnedSocketServer)[SOCKET_HEARTBEAT] = hb;
+      server.on('close', () => clearInterval(hb));
+      lock.release();
       resolve(server);
     });
   });
+}
+
+/** Owner heartbeat period: the listener touches its socket file this often. */
+export const SOCKET_HEARTBEAT_MS = 5_000;
+/**
+ * A refused probe on a socket file touched more recently than this is a BUSY
+ * owner, not a dead one. Six heartbeats of slack; a crashed owner's file goes
+ * stale after this and is reaped by the next starter.
+ */
+export const SOCKET_HEARTBEAT_STALE_MS = 30_000;
+
+/**
+ * A start lock whose recorded owner is ALIVE is reclaimed only past this age
+ * (a starter suspended mid-start, or a reused pid) — well past the ~300 ms a
+ * start holds it. A lock whose owner pid is gone is reclaimed at once.
+ */
+export const START_LOCK_STALE_MS = 60_000;
+
+export interface StartLock {
+  /** Give the lock back — only if it is still the directory we created. */
+  release(): void;
+  /** Is the lock directory still the one we created (same inode)? */
+  held(): boolean;
+}
+
+/**
+ * Serialize probe → reap → listen across processes with an atomic mkdir at
+ * `<socketPath>.starting`, our pid recorded inside. Returns null when another
+ * starter holds the lock (it becomes the provider; this one returns null
+ * upstream). A lock whose recorded owner is dead (kill(pid, 0) → ESRCH) is
+ * reclaimed immediately; one whose owner is alive or unknown only once older
+ * than START_LOCK_STALE_MS. Reclaim is rename-then-remove, so of two
+ * reclaimers exactly one proceeds; release is inode-checked, so a starter
+ * that was reclaimed from cannot remove the reclaimer's fresh lock.
+ */
+export function acquireStartLock(socketPath: string): StartLock | null {
+  const lockDir = `${socketPath}.starting`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(lockDir);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') return null;
+      if (!startLockIsStale(lockDir)) return null;
+      // Atomic reclaim: one reclaimer wins the rename; the other's rename
+      // fails and its next mkdir meets the winner's fresh lock.
+      const tomb = `${lockDir}.reclaimed-${process.pid}-${Date.now()}`;
+      try {
+        renameSync(lockDir, tomb);
+        rmSync(tomb, { recursive: true, force: true });
+      } catch { /* someone else reclaimed it first */ }
+      continue;
+    }
+    let ino: number;
+    try {
+      writeFileSync(join(lockDir, 'owner'), `${process.pid}\n`, { mode: 0o600 });
+      ino = statSync(lockDir).ino;
+    } catch {
+      // A lock we cannot identify is a lock we must not hold: it would block
+      // every other starter until reclaimed.
+      try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* noop */ }
+      return null;
+    }
+    const held = () => {
+      try { return statSync(lockDir).ino === ino; } catch { return false; }
+    };
+    return {
+      held,
+      release: () => {
+        if (!held()) return;
+        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* already gone */ }
+      },
+    };
+  }
+  return null;
+}
+
+/** Is `lockDir` a start lock nobody live holds? See acquireStartLock. */
+function startLockIsStale(lockDir: string): boolean {
+  try {
+    const ageMs = Date.now() - statSync(lockDir).mtimeMs;
+    const pid = readPidFile(join(lockDir, 'owner'));
+    if (pid !== null && processAlive(pid) === false) return true; // owner died mid-start
+    return ageMs > START_LOCK_STALE_MS;
+  } catch {
+    return false; // vanished under us — the caller's next mkdir decides
+  }
+}
+
+function readPidFile(path: string): number | null {
+  try {
+    const n = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does a process with this pid exist? kill(pid, 0) sends nothing: true when
+ * it exists (EPERM counts — it exists, it is just not ours), false on ESRCH,
+ * null when the answer cannot be had.
+ */
+export function processAlive(pid: number): boolean | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException)?.code;
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
+    return null;
+  }
+}
+
+/** Sidecar beside the socket naming its owner: `{ pid, ino }` of the listener that bound it. */
+export function ownerSidecarPath(socketPath: string): string {
+  return `${socketPath}.owner`;
+}
+
+function writeOwnerSidecar(socketPath: string, ino: number): void {
+  try {
+    writeFileSync(ownerSidecarPath(socketPath), `${JSON.stringify({ pid: process.pid, ino })}\n`, { mode: 0o600 });
+  } catch { /* best effort — probers fall back to the heartbeat */ }
+}
+
+/**
+ * Read the owner record. Null when absent, malformed, or — given the socket
+ * file's current inode — naming a different inode (a previous owner's record
+ * the newcomer has not yet replaced).
+ */
+export function readOwnerSidecar(socketPath: string, currentIno?: number): { pid: number; ino: number } | null {
+  try {
+    const raw = JSON.parse(readFileSync(ownerSidecarPath(socketPath), 'utf8')) as { pid?: unknown; ino?: unknown };
+    if (typeof raw.pid !== 'number' || typeof raw.ino !== 'number') return null;
+    if (currentIno !== undefined && raw.ino !== currentIno) return null;
+    return { pid: raw.pid, ino: raw.ino };
+  } catch {
+    return null;
+  }
+}
+
+function removeOwnerSidecarIfOurs(socketPath: string, ino: number): void {
+  const side = readOwnerSidecar(socketPath);
+  if (!side || side.ino !== ino) return; // absent, or a newer owner's — leave it
+  try { unlinkSync(ownerSidecarPath(socketPath)); } catch { /* noop */ }
+}
+
+/** Property under which `startResolveIpcServer` records the inode it bound. */
+const OWNED_SOCKET_INODE = Symbol.for('gbrain.resolveIpc.ownedSocketInode');
+/** Property holding the owner heartbeat timer. */
+const SOCKET_HEARTBEAT = Symbol.for('gbrain.resolveIpc.socketHeartbeat');
+type OwnedSocketServer = net.Server & {
+  [OWNED_SOCKET_INODE]?: number;
+  [SOCKET_HEARTBEAT]?: ReturnType<typeof setInterval>;
+};
+
+/**
+ * Does the file currently at `socketPath` have the inode `server` recorded at
+ * listen time? False when the path is gone, was replaced by another serve, or
+ * ownership was never recorded.
+ */
+export function ownsSocketPath(socketPath: string, server: net.Server): boolean {
+  const owned = (server as OwnedSocketServer)[OWNED_SOCKET_INODE];
+  if (owned === undefined) return false;
+  try {
+    return existsSync(socketPath) && statSync(socketPath).ino === owned;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Unlink `socketPath` only if it is still the file `server` created (same
+ * inode as recorded at listen time). Returns true when a file was unlinked.
+ * Another serve may have replaced the path since we bound it, and deleting
+ * their live socket on our way out is how every exiting serve used to take
+ * the provider down (#4896). Unknown ownership (stat failed at bind) → leave
+ * the file; a stale leftover is reaped by the next starter's probe.
+ */
+export function unlinkSocketIfOwned(socketPath: string, server: net.Server): boolean {
+  if (!ownsSocketPath(socketPath, server)) return false;
+  try {
+    unlinkSync(socketPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shut a resolve-IPC listener down WITHOUT taking a newer owner's socket with
+ * it. Under Bun (measured 1.3.13, macOS) `server.close()` on a unix-socket
+ * listener unlinks the PATHNAME, whether or not the file there is still this
+ * server's — a displaced listener closing on exit deleted the newcomer's live
+ * socket every time. Rule: close (and reap) only while we still own the path;
+ * otherwise leave the listener to die with the process — an unnamed socket
+ * holds no path and hurts nobody. Returns what happened, for tests/telemetry.
+ */
+export function closeResolveIpcServer(
+  socketPath: string,
+  server: net.Server,
+): 'closed' | 'left-open-displaced' | 'left-open-unknown' {
+  // Stop the heartbeat on every path: a listener we leave open must never keep
+  // touching a file at the path (it is either gone or someone else's).
+  const hb = (server as OwnedSocketServer)[SOCKET_HEARTBEAT];
+  if (hb) clearInterval(hb);
+  const owned = (server as OwnedSocketServer)[OWNED_SOCKET_INODE];
+  if (owned === undefined) {
+    // Windows: Bun's statSync() cannot see the AF_UNIX reparse-point file
+    // (#4333), so ownership is never recorded there — plain close, the
+    // pre-change behaviour. On POSIX an unknown inode means our stat right
+    // after listen() failed; leaving the listener to die with the process is
+    // the conservative choice.
+    if (process.platform === 'win32') {
+      try { server.close(); } catch { /* noop */ }
+      return 'closed';
+    }
+    return 'left-open-unknown';
+  }
+  if (!ownsSocketPath(socketPath, server)) return 'left-open-displaced';
+  try { server.close(); } catch { /* noop */ }
+  // Runtimes that do not unlink on close (Node) still need the reap; under Bun
+  // the path is already gone and this is a no-op.
+  unlinkSocketIfOwned(socketPath, server);
+  removeOwnerSidecarIfOurs(socketPath, owned);
+  return 'closed';
 }
 
 /** turn_context server path: auth [S3#6] → source binding [CX2-10] → budgeted assembly [G11]. */
@@ -1003,27 +1303,32 @@ async function handleSyncKind<Req extends { protocol: number; secret: string }, 
  * Is something listening at `socketPath`? The same owner probe the pre-bind
  * check uses: a leftover socket FILE (dead owner) is not a live provider, so
  * callers must use this rather than existsSync() to decide "a serve is
- * here". 'unknown' (probe timed out) counts as live — the conservative
- * reading, identical to the bind path's "never displace on a timeout".
+ * here". 'unknown' (probe timed out, or a connect error that describes the
+ * prober rather than the owner) counts as live — the conservative reading,
+ * identical to the bind path's "never displace on a timeout".
  */
 export async function socketHasLiveListener(socketPath: string): Promise<boolean> {
   return (await probeSocketOwner(socketPath)) !== 'dead';
 }
 
 /**
- * Who owns `socketPath`? 'live' — something accepted the connect (a serve).
- * 'dead' — the connect was hard-refused (ENOENT / ECONNREFUSED / ENOTSOCK:
- * nothing listens; the entry is a dead owner's leftover the caller may
- * remove). 'unknown' — the CLIENT_TIMEOUT_MS budget lapsed with the connect
- * neither accepted nor refused (a live serve too busy to accept). The caller must
- * never clean up on 'unknown': a timeout read as "dead" let a transient
- * serve displace a long-lived one, the very #4896 symptom. The server side
- * tolerates the data-less probe: one-request-per-connection means a
- * connection that closes before its first line is just destroyed.
+ * Who owns `socketPath`? 'live' — something accepted the connect (a serve),
+ * OR the connect was refused while the socket file's owner heartbeat is
+ * fresh (a live serve too busy to accept — see classifyRefusedProbe).
+ * 'dead' — the connect was hard-refused (ENOENT / ECONNREFUSED / ENOTSOCK)
+ * and no fresh heartbeat vouches for an owner: the entry is a dead owner's
+ * leftover the caller may remove. 'unknown' — the CLIENT_TIMEOUT_MS budget
+ * lapsed with the connect neither accepted nor refused, or the error (EMFILE,
+ * EACCES, …) says nothing about the owner. The caller must never clean up on
+ * 'unknown': a timeout read as "dead" let a transient serve displace a
+ * long-lived one, the very #4896 symptom. The server side tolerates the
+ * data-less probe: one-request-per-connection means a connection that closes
+ * before its first line is just destroyed.
  */
-type SocketOwner = 'live' | 'dead' | 'unknown';
-function probeSocketOwner(socketPath: string): Promise<SocketOwner> {
-  return new Promise((resolve) => {
+export type SocketOwner = 'live' | 'dead' | 'unknown';
+export async function probeSocketOwner(socketPath: string): Promise<SocketOwner> {
+  let code: string | undefined;
+  const raw = await new Promise<SocketOwner>((resolve) => {
     let settled = false;
     const probe = new net.Socket();
     const finish = (owner: SocketOwner) => {
@@ -1034,11 +1339,98 @@ function probeSocketOwner(socketPath: string): Promise<SocketOwner> {
     };
     // Listeners BEFORE connect(): under `bun test` Bun can emit the ENOENT
     // for an absent path synchronously inside connect(), which would be an
-    // unhandled 'error' if attached afterwards.
+    // unhandled 'error' if attached afterwards. The code is captured by the
+    // first 'error' listener so the refusal can be classified below; the
+    // 'dead' the second one settles is the RAW verdict, not the final one.
+    probe.once('error', (e: NodeJS.ErrnoException) => { code = e?.code; });
     probe.once('connect', () => finish('live'));
     probe.once('error', () => finish('dead'));
     probe.once('timeout', () => finish('unknown'));
     probe.setTimeout(CLIENT_TIMEOUT_MS);
     try { probe.connect(socketPath); } catch { finish('dead'); }
   });
+  if (raw !== 'dead') return raw;
+  return classifyRefusedProbe(code, probeFileInfo(socketPath));
+}
+
+/** What the filesystem says about the path when a probe connect fails. */
+export interface ProbeFileInfo {
+  exists: boolean;
+  isSocket: boolean;
+  /** Age of the file's mtime in ms (the owner heartbeat), null when absent. */
+  mtimeAgeMs: number | null;
+  /**
+   * Owner record verdict: true — the recorded owner pid exists; false — it is
+   * gone (ESRCH); null — no usable record (absent, malformed, naming another
+   * inode, or kill(pid, 0) could not tell).
+   */
+  ownerAlive: boolean | null;
+}
+
+export function probeFileInfo(socketPath: string): ProbeFileInfo {
+  try {
+    const st = statSync(socketPath);
+    const isSocket = st.isSocket();
+    const side = isSocket ? readOwnerSidecar(socketPath, st.ino) : null;
+    return {
+      exists: true,
+      isSocket,
+      mtimeAgeMs: Date.now() - st.mtimeMs,
+      ownerAlive: side ? processAlive(side.pid) : null,
+    };
+  } catch {
+    return { exists: false, isSocket: false, mtimeAgeMs: null, ownerAlive: null };
+  }
+}
+
+/**
+ * An owner whose process is alive but whose heartbeat is older than this is
+ * treated as gone anyway: a stall this long, or a reused pid behind a dead
+ * owner's record. Bounds how long a leftover can hold the path hostage.
+ */
+export const OWNER_STALL_LIMIT_MS = 300_000;
+
+/**
+ * Classify a probe connect that did NOT succeed. The error code alone cannot:
+ * measured on Bun 1.3.13 / macOS, 172 of 300 connects to a LIVE listener whose
+ * event loop was stalled for 4 s failed with ENOENT — the same code a regular
+ * file (or nothing) at the path produces — so "hard refusal = dead owner"
+ * reaps a busy provider. Two signals decide instead, for a SOCKET file:
+ *
+ * 1. The owner record (`<socket>.owner`, pid + inode), evidence that does not
+ *    share the owner's event loop: pid gone → 'dead' at once, however fresh
+ *    the file (a crashed provider's replacement binds immediately); pid alive
+ *    → 'live' until the heartbeat is OWNER_STALL_LIMIT_MS old.
+ * 2. The heartbeat: an mtime younger than `staleMs` → 'live' (an owner too
+ *    busy to accept, or one that left no record).
+ *
+ * Otherwise ENOENT / ECONNREFUSED / ENOTSOCK (and a connect() that threw
+ * synchronously, code undefined) prove nothing listens → 'dead'; every other
+ * code — EMFILE/ENFILE (our own fd exhaustion), EACCES/EPERM, EAGAIN,
+ * ETIMEDOUT, unknown — describes the prober, not the owner → 'unknown'
+ * (defer, never reap). The cost of a wrong 'live'/'unknown' is one serve
+ * without an IPC binding; the cost of a wrong 'dead' is unlinking the socket
+ * every session's hooks depend on.
+ */
+export function classifyRefusedProbe(
+  code: string | undefined,
+  info: ProbeFileInfo,
+  staleMs: number = SOCKET_HEARTBEAT_STALE_MS,
+  ownerStallLimitMs: number = OWNER_STALL_LIMIT_MS,
+): SocketOwner {
+  if (info.exists && info.isSocket) {
+    if (info.ownerAlive === false) return 'dead';
+    const ageMs = info.mtimeAgeMs ?? Number.POSITIVE_INFINITY;
+    if (info.ownerAlive === true && ageMs < ownerStallLimitMs) return 'live';
+    if (ageMs < staleMs) return 'live';
+  }
+  switch (code) {
+    case undefined:
+    case 'ENOENT':
+    case 'ECONNREFUSED':
+    case 'ENOTSOCK':
+      return 'dead';
+    default:
+      return 'unknown';
+  }
 }

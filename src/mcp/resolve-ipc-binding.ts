@@ -24,6 +24,7 @@ import { loadConfig } from '../core/config.ts';
 import {
   resolveSocketPathForConfig,
   startResolveIpcServer,
+  closeResolveIpcServer,
   ensureIpcSecretForConfig,
   type IpcHandlers,
 } from '../core/context/resolve-ipc.ts';
@@ -78,9 +79,18 @@ export function isVolunteerProbeShaped(req: {
   );
 }
 
+/**
+ * Standby re-election (#4896 follow-up): a serve whose start deferred to a
+ * live owner re-probes the socket this often, so when that owner dies the
+ * path is re-bound within one interval instead of waiting for a new serve to
+ * start. unref'd — a transient serve still exits on its own schedule.
+ */
+export const IPC_REBIND_INTERVAL_MS = 30_000;
+
 export async function bindResolveIpcForServe(
   engine: BrainEngine,
   defaultSource: string,
+  bindOpts: { rebindIntervalMs?: number } = {},
 ): Promise<ResolveIpcBinding> {
   try {
     const cfg = loadConfig();
@@ -141,7 +151,7 @@ export async function bindResolveIpcForServe(
       }
     }
 
-    const server = await startResolveIpcServer(
+    const startListener = () => startResolveIpcServer(
       resolveSocket,
       {
         // [CX2-10] Bound-source posture for BOTH kinds: the IPC layer
@@ -221,23 +231,45 @@ export async function bindResolveIpcForServe(
         secret: ipcSecret,
       },
     );
-
-    // startResolveIpcServer returns null when the socket is already owned
-    // by a live listener (another serve) — that serve is the IPC provider.
-    if (!server) return NULL_BINDING;
+    const server = await startListener();
 
     let closed = false;
-    return {
+    let rebind: ReturnType<typeof setInterval> | undefined;
+    const binding: ResolveIpcBinding = {
       server,
-      socketPath: resolveSocket,
+      socketPath: server ? resolveSocket : null,
       close: () => {
         if (closed) return;
         closed = true;
-        // server.close() unlinks the pathname THIS listener bound; never
-        // blind-unlink the path — it may belong to a newer live serve (#4896).
-        try { server.close(); } catch { /* noop */ }
+        if (rebind) clearInterval(rebind);
+        // Close and reap only while the path is still ours. Under Bun
+        // (measured 1.3.13, macOS) server.close() unlinks the PATHNAME, not
+        // the file this listener bound, so a displaced listener closing on
+        // exit deleted a newer live serve's socket (#4896 follow-up); such a
+        // listener is left to die with the process instead. Never blind-unlink.
+        if (binding.server) closeResolveIpcServer(resolveSocket, binding.server);
       },
     };
+
+    // startResolveIpcServer returns null when the socket is owned by a live
+    // listener (another serve) — that serve is the IPC provider. Stay a
+    // standby: re-probe on an interval so that when the provider dies its
+    // leftover is reaped and the path re-bound by the first standby to look,
+    // instead of every hook degrading until some serve happens to start.
+    if (!server) {
+      rebind = setInterval(() => {
+        if (closed) { if (rebind) clearInterval(rebind); return; }
+        void startListener().then((late) => {
+          if (!late) return;
+          if (closed) { closeResolveIpcServer(resolveSocket, late); return; }
+          binding.server = late;
+          binding.socketPath = resolveSocket;
+          if (rebind) clearInterval(rebind);
+        });
+      }, bindOpts.rebindIntervalMs ?? IPC_REBIND_INTERVAL_MS);
+      rebind.unref?.();
+    }
+    return binding;
   } catch {
     /* resolve IPC is best-effort; never block serve */
     return NULL_BINDING;
