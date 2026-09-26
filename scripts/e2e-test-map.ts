@@ -273,7 +273,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // getEdgesByChunk) live in the peeled engine modules; both modules key the
   // cross-engine read-parity suite directly. (The engine-dir ** globs above
   // match these files too; the selector unions the entries.)
-  "src/core/postgres-engine/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts"],
+  "src/core/postgres-engine/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts", "test/e2e/code-edges-batching-postgres.test.ts"],
   "src/core/pglite-engine/code-edges.ts": ["test/e2e/code-edges-read-parity.test.ts"],
   // D7 parity batch: chronicle ontology merge (mergeOntologyFact helpers in
   // chronicle/ontology.ts) + event projection (only production caller:

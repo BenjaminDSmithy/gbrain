@@ -8,6 +8,14 @@ import { currentCodeEdgeFilter } from '../code-intel/read-scope.ts';
 
 type PgSql = ReturnType<typeof postgres>;
 
+// postgres.js rejects a statement with 65,534 or more bind parameters before
+// sending it (MAX_PARAMETERS_EXCEEDED in postgres/src/connection.js), so the
+// server logs nothing. A 1.5 MB minified bundle yields ~11k unresolved edges
+// at 6 binds each; one INSERT per edge shape threw and rolled back the page's
+// projection. 30,000 leaves wide headroom below that limit; the two edge
+// shapes use 7 and 6 binds per row respectively.
+const POSTGRES_EDGE_BATCH_MAX_BIND_PARAMS = 30_000;
+
 /** Narrow slice of PostgresEngine the code-edge operations use. */
 export interface PgCodeEdgesDeps {
   /** Live postgres.js pool (getter-backed at the call site). */
@@ -21,16 +29,18 @@ export async function addCodeEdges(deps: PgCodeEdgesDeps, edges: import('../type
     const resolved = edges.filter(e => e.to_chunk_id != null);
     const unresolved = edges.filter(e => e.to_chunk_id == null);
 
-    if (resolved.length > 0) {
-      // Per-row placeholders with $n::text::jsonb for edge_metadata. Bun SQL
-      // mis-encodes jsonb[] array binds (double-encoded strings landed in
-      // edge_metadata — the resolver then read `"{}"` scalars and 0 edges ever
-      // resolved). ::text::jsonb per row is the codebase-wide safe shape
-      // (executeRawJsonb, PGLite's addCodeEdges).
+    // Per-row placeholders with $n::text::jsonb for edge_metadata. Bun SQL
+    // mis-encodes jsonb[] array binds (double-encoded strings landed in
+    // edge_metadata — the resolver then read `"{}"` scalars and 0 edges ever
+    // resolved). ::text::jsonb per row is the codebase-wide safe shape
+    // (executeRawJsonb, PGLite's addCodeEdges).
+    const resolvedBatchSize = Math.floor(POSTGRES_EDGE_BATCH_MAX_BIND_PARAMS / 7);
+    for (let offset = 0; offset < resolved.length; offset += resolvedBatchSize) {
+      const batch = resolved.slice(offset, offset + resolvedBatchSize);
       const rowParts: string[] = [];
       const params: unknown[] = [];
       let p = 1;
-      for (const e of resolved) {
+      for (const e of batch) {
         rowParts.push(`($${p++}::int, $${p++}::int, $${p++}, $${p++}, $${p++}, $${p++}::text::jsonb, $${p++})`);
         params.push(
           e.from_chunk_id, e.to_chunk_id as number,
@@ -49,11 +59,13 @@ export async function addCodeEdges(deps: PgCodeEdgesDeps, edges: import('../type
       inserted += (res as unknown as { count: number }).count ?? 0;
     }
 
-    if (unresolved.length > 0) {
+    const unresolvedBatchSize = Math.floor(POSTGRES_EDGE_BATCH_MAX_BIND_PARAMS / 6);
+    for (let offset = 0; offset < unresolved.length; offset += unresolvedBatchSize) {
+      const batch = unresolved.slice(offset, offset + unresolvedBatchSize);
       const rowParts: string[] = [];
       const params: unknown[] = [];
       let p = 1;
-      for (const e of unresolved) {
+      for (const e of batch) {
         rowParts.push(`($${p++}::int, $${p++}, $${p++}, $${p++}, $${p++}::text::jsonb, $${p++})`);
         params.push(
           e.from_chunk_id,
