@@ -57,8 +57,8 @@ export interface DialectCapabilities {
   /**
    * Upper bound on bind parameters one batched write statement may carry.
    * PGLite's parameter bridge corrupts the session past the signed int16
-   * ceiling (32,767), so PGLite batches below 30,000. Postgres never batched
-   * on master: `Infinity` keeps one statement per write.
+   * ceiling (32,767), and postgres.js refuses a statement with 65,534 or more
+   * binds before sending it, so both dialects batch below 30,000.
    */
   readonly maxBindParamsPerStatement: number;
   /**

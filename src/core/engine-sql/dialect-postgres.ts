@@ -50,7 +50,10 @@ export interface PostgresExecutorDeps {
 }
 
 export const POSTGRES_CAPABILITIES: DialectCapabilities = {
-  maxBindParamsPerStatement: Number.POSITIVE_INFINITY,
+  // postgres.js refuses a statement with 65,534 or more binds before sending
+  // it (MAX_PARAMETERS_EXCEEDED, vendor/postgres/src/connection.js). 30,000
+  // leaves wide headroom and matches PGLite's split points.
+  maxBindParamsPerStatement: 30_000,
   transactionAdvisoryLocks: true,
   probesEmbeddingCast: true,
 };

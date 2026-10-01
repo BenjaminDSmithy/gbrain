@@ -7,9 +7,9 @@
  * in src/core/pglite-engine/code-edges.ts (docs/designs/refactor-wave-1/w1-inventory.md).
  *
  * Capability `maxBindParamsPerStatement`: PGLite's parameter bridge corrupts
- * the session past 32,767 binds, so bulk inserts split below 30,000 binds
- * there; Postgres (Infinity) keeps master's single statement per shape. The
- * inserts keep master's direct `unsafe` path (they were raw on master).
+ * the session past 32,767 binds, and postgres.js refuses 65,534 or more, so
+ * bulk inserts split below 30,000 binds on both. The inserts keep master's
+ * direct `unsafe` path (they were raw on master).
  * Reads were unscoped on master (EO4 inventory): `LegacyUnscopedRead`.
  */
 import type { CodeEdgeInput, CodeEdgeResult } from '../types.ts';

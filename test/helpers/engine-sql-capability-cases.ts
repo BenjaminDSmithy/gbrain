@@ -3,8 +3,9 @@
  * concurrent-write test (refactor wave 1, Engineering contracts "Dialect
  * capabilities"; docs/designs/refactor-wave-1/w1-inventory.md):
  *
- *   maxBindParamsPerStatement  PGLite splits code-edge inserts below 30,000
- *                              binds; Postgres keeps one statement.
+ *   maxBindParamsPerStatement  Both dialects split code-edge inserts below
+ *                              30,000 binds (PGLite's int16 bridge; postgres.js
+ *                              refuses 65,534 or more).
  *   transactionAdvisoryLocks   Postgres serializes same-entity fact inserts
  *                              with pg_advisory_xact_lock; PGLite never locks.
  *   probesEmbeddingCast        Postgres casts fact vectors to the live column
@@ -55,7 +56,7 @@ export function defineCapabilityCases(opts: { family: Family; getEngine: () => B
   test(`capabilities are the ${family} values`, () => {
     expect(engineSql(opts.getEngine()).capabilities).toEqual(family === 'pglite'
       ? { maxBindParamsPerStatement: 30_000, transactionAdvisoryLocks: false, probesEmbeddingCast: false }
-      : { maxBindParamsPerStatement: Number.POSITIVE_INFINITY, transactionAdvisoryLocks: true, probesEmbeddingCast: true });
+      : { maxBindParamsPerStatement: 30_000, transactionAdvisoryLocks: true, probesEmbeddingCast: true });
   });
 
   test('bind batching: the per-statement boundary (6 binds per unresolved edge)', async () => {
@@ -67,11 +68,23 @@ export function defineCapabilityCases(opts: { family: Family; getEngine: () => B
     expect(atLimit.statements()).toBe(1);
     const overLimit = countingExecutor(engine);
     expect(await addCodeEdges(overLimit.exec, unresolved(chunk, 'over-limit', perStatement + 1))).toBe(perStatement + 1);
-    expect(overLimit.statements()).toBe(family === 'pglite' ? 2 : 1);
+    expect(overLimit.statements()).toBe(2);
     const rows = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM code_edges_symbol WHERE from_chunk_id = $1`, [chunk]);
     expect(rows[0].n).toBe(2 * perStatement + 1);
   }, 60_000);
+
+  test('bind batching: a set past the postgres.js limit (11,000 edges, 66,000 binds unbatched) lands in full', async () => {
+    const engine = opts.getEngine();
+    const chunk = await codeChunk(engine, `code/capability-past-limit-${family}`);
+    const count = 11_000;
+    const counted = countingExecutor(engine);
+    expect(await addCodeEdges(counted.exec, unresolved(chunk, 'past-limit', count))).toBe(count);
+    expect(counted.statements()).toBe(Math.ceil(count / Math.floor(30_000 / 6)));
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM code_edges_symbol WHERE from_chunk_id = $1`, [chunk]);
+    expect(rows[0].n).toBe(count);
+  }, 120_000);
 
   test('bind batching: concurrent overlapping writers insert each edge exactly once', async () => {
     const engine = opts.getEngine();
